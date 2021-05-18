@@ -4,6 +4,7 @@ import math
 from scipy.stats import lognorm
 import pandas as pd
 import random
+from collections import deque
 random.seed(12345)
 np.random.seed(12345)
 
@@ -64,12 +65,22 @@ def data_input(df):
         now['mu'] = uplifts_data.loc[i, 'Параметр mu для извлекаемых запасов нефти']
         now['sigma'] = uplifts_data.loc[i, 'Параметр sigma для извлекаемых запасов нефти']
         now['oil_expectations'] = now['probability'] * lognorm.stats(now['sigma'], moments = 'm', scale = np.exp(now['mu']))
-        now['money_expectations'] = (oil_stats['netback'] - pipe_stats['oper_cost_multi']) * now['oil_expectations'] \
-                                    - recon_stats['cost'] - well_stats['cost'] #максимальное число денег, которое мы полуим без учетов налогов
+
+        now['money_expectations'] = dict()
+        now['money_expectations']['pipe'] = (oil_stats['netback'] - pipe_stats['oper_cost_multi']) * now['oil_expectations'] \
+                                    - recon_stats['cost'] - well_stats['cost']
+        now['money_expectations']['cars'] = (oil_stats['netback'] - cars_stats['oper_cost_multi']) * now['oil_expectations'] \
+                                    - recon_stats['cost'] - well_stats['cost']
         now['recon_rating'] = 0
         now['oil'] = 0  # количество нефти после разведки, если она там есть
+        now['going_to_recon'] = False
+        now['recon_started'] = False
         now['reconed'] = False
         now['recon_time'] = 10 ** 8
+
+        now['money'] = dict()
+        now['money']['pipe'] = -10 ** 8
+        now['money']['cars'] = -10 ** 8
         now['going_to_build'] = False
         now['build_already_planed'] = False
         uplifts.append(copy.deepcopy(now))
@@ -124,22 +135,43 @@ def timeline_creation(n):
         timeline.append(copy.deepcopy(now))
     return timeline
 
-def recon_rating_create(uplifts):
+def recon_rating_create(uplifts, delivery_type):
     for uplift in uplifts:
-        uplift['recon_rating'] = uplift['money_expectations'] / uplift['sigma']
+        uplift['recon_rating'] = uplift['money_expectations'][delivery_type] / uplift['sigma']
     return uplifts
 
-def recon_set(recon_stats, timeline, uplifts):
+def recon_queue_create(recon_stats, timeline, uplifts):
     uplifts.sort(key = lambda uplift: uplift['recon_rating'], reverse = True)
+    recon_queue = deque()
     for i in range(len(uplifts)):
-        timeline_pointer = (i // recon_stats['teams']) * recon_stats['duration']
-        timeline[timeline_pointer]['recon_started'].append(uplifts[i]['id'])
-        timeline[timeline_pointer + recon_stats['duration']]['recon_finished'].append(uplifts[i]['id'])
-        uplifts[i]['recon_time'] = timeline_pointer + recon_stats['duration']
+        if uplifts[i]['going_to_recon']:
+            recon_queue.append(uplift[i]['id'])
     uplifts.sort(key = lambda uplift: uplift['id'])
-    return timeline, uplifts
+    return recon_queue
 
-def timeline_update(timeline, uplifts, start_time): #после выбора всех скважин, где будем бурить
+def recon_set(recon_stats, timeline, uplifts, start_pointer, finish_pointer, recon_teams_free_time, first_free_recon_team_pointer):
+    for team_id in range(recon_stats['teams']):
+        recon_teams_free_time[team_id] = max(recon_teams_free_time[team_id], start_pointer)
+
+    uplifts.sort(key=lambda uplift: uplift['recon_rating'], reverse=True)
+    for i in range(len(uplifts)):
+        if recon_teams_free_time[first_free_recon_team_pointer] < finish_pointer and uplifts[i]['going_to_recon'] and not uplifts[i]['recon_started']:
+            recon_start_time = recon_teams_free_time[first_free_recon_team_pointer]
+            #timeline_pointer[recon_start_time] = (i // recon_stats['teams']) * recon_stats['duration']
+            timeline[recon_start_time]['recon_started'].append(uplifts[i]['id'])
+            timeline[recon_start_time + recon_stats['duration']]['recon_finished'].append(uplifts[i]['id'])
+
+            uplifts[i]['recon_time'] = recon_start_time + recon_stats['duration']
+            uplifts[i]['recon_started'] = True
+
+            recon_teams_free_time[first_free_recon_team_pointer] += recon_stats['duration']
+            first_free_recon_team_pointer += 1
+            first_free_recon_team_pointer %= recon_stats['teams']
+            print(recon_teams_free_time)
+    uplifts.sort(key=lambda uplift: uplift['id'])
+    return uplifts, recon_teams_free_time, first_free_recon_team_pointer
+
+def timeline_build_update(timeline, uplifts, destroy_pipe_pointer, start_time): #после выбора всех скважин, где будем бурить
     for uplift in uplifts:
         if uplift['going_to_build'] and not uplift['build_already_planed']:
             #print(start_time, uplift['recon_time'])
@@ -149,7 +181,9 @@ def timeline_update(timeline, uplifts, start_time): #после выбора в�
             timeline[build_start]['build_started'].append(uplift['id'])
             timeline[build_start + well_stats['duration']]['build_finished'].append(uplift['id'])
             uplift['build_already_planed'] = True
-    return timeline
+
+            destroy_pipe_pointer = max(destroy_pipe_pointer, build_start + well_stats['duration'])
+    return timeline, destroy_pipe_pointer
 
 def printer(timeline):
     for i in timeline:
@@ -224,39 +258,26 @@ def oil_generation_with_considering_reconed_wells(uplifts):
                 uplift['oil'] = 0
     return uplifts
 
-def choose_wells_to_build(oper_stats, oil_stats, well_stats, uplifts):
-    multi = oper_stats['multi']
-    add = oper_stats['add']
+#главное отличие между def choose_wells_to_build и choose_wells_to_recon, что первое из низ мы выбираем из броска точек в монтекарло, а второе из матожидания
+def choose_wells_to_recon(uplifts, delivery_type):
     for uplift in uplifts:
-        #print(uplift['oil'] * multi + well_stats['cost'], uplift['oil'] * oil_stats['netback'])
-        if uplift['oil'] * multi + well_stats['cost'] < uplift['oil'] * oil_stats['netback']:
+        if uplift['money_expectations'][delivery_type] > 0:
+            uplift['going_to_recon'] = True
+    return uplifts
+
+def choose_wells_to_build(uplifts, delivery_type):
+    for uplift in uplifts:
+        if uplift['money']['delivery_type'] > 0 and uplift['going_to_recon']:
             uplift['going_to_build'] = True
     return uplifts
 
-def add_multi_oper_stats_update_type(pipe_stats, cars_stats, delivery_type):
-    oper_stats = dict()
-    if delivery_type == 'pipe':
-        oper_stats['multi'] = pipe_stats['oper_cost_multi']
-        oper_stats['add'] = pipe_stats['oper_cost_add']
-        oper_stats['limit'] = pipe_stats['limit']
-    elif delivery_type == 'cars':
-        oper_stats['multi'] = cars_stats['oper_cost_multi']
-        oper_stats['add'] = cars_stats['oper_cost_add']
-        oper_stats['limit'] = cars_stats['limit']
-    else:
-        oper_stats['multi'] = 0
-        oper_stats['add'] = 0
-        oper_stats['limit'] = 0
-    return oper_stats
-
-def build_well_or_not(pipe_stats, oil_stats, well_stats, uplift):
-    multi = pipe_stats['oper_cost_multi']
-    add = pipe_stats['oper_cost_add']
-    build_flag = False
-    if uplift['oil'] * multi + well_stats['cost'] < uplift['oil'] * oil_stats['netback']:
-        uplift['going_to_build'] = True
-        build_flag = True
-    return uplift, True
+def uplifts_money_update(uplifts, oil_stats, pipe_stats, cars_stats):
+    for uplift in uplifts:
+        uplift['money']['pipe'] = (oil_stats['netback'] - pipe_stats['oper_cost_multi']) * uplift['oil'] - \
+                               well_stats['cost']
+        uplift['money']['cars'] = (oil_stats['netback'] - cars_stats['oper_cost_multi']) * uplift['oil'] - \
+                               well_stats['cost']
+    return uplifts
 
 def timeline_pipe_build_update(timeline, pipe_build_year, pipe_build_month, pipe_stats):
     timeline_pointer = (pipe_build_year - 2021) * 12 + pipe_build_month
@@ -284,15 +305,6 @@ def recon_results_create(uplifts):
             recon_results[i] = 0
     return recon_results
 
-def uplifts_oil_update_expectacions_(uplifts, recon_results, pipe_build_year, pipe_build_month):
-    pipe_build_timeline_pointer = (pipe_build_year - 2021) * 12 + pipe_build_month
-    for uplift in uplifts:
-        if uplift['recon_time'] < pipe_build_timeline_pointer:
-            uplift['oil'] = recon_results[uplift['id']]
-        else:
-            uplift['oil'] = uplift['oil_expectations']
-    return uplifts
-
 def uplifts_oil_update_generation_with_considering_reconed_wells(uplifts, recon_results):
     for uplift in uplifts:
         if uplift['reconed']:
@@ -316,12 +328,17 @@ def uplifts_reconed_update(timeline, uplifts, pipe_build_year, pipe_build_month)
 def simulation_cars_pipe(timeline, uplifts, pipe_build_year, pipe_build_month, tax_stats, pipe_stats, cars_stats):
     # до постройки возим машинами, потом строим и возим трубой
     #выбираем какие скважины мы построим после разведки и наносим их на таймлайн
+    print('cars_pipe')
+    printer(uplifts)
     delivery_type = 'cars'
-    oper_stats = add_multi_oper_stats_update_type(pipe_stats, cars_stats, delivery_type)
-    uplifts = choose_wells_to_build(oper_stats, oil_stats, well_stats, uplifts) #тут же 2 типа доаставки, нельзя так делать
-    # хотя можно нанести на таймлайн все постройки для доставки машинами, а потом дописать и те, которые в + выходят при трубе
+    uplifts = choose_wells_to_recon(uplifts, delivery_type)
+    uplifts = choose_wells_to_build(uplifts, delivery_type)
+    printer(uplifts)
+    print('cars_pipe_end')
+
     #printer(uplifts)
-    timeline = timeline_update(timeline, uplifts, 0)
+    destroy_pipe_pointer = 0
+    timeline, destroy_pipe_pointer = timeline_build_update(timeline, uplifts, 0)
 
     #постройка трубопровода в таймлайне
     pipe_build_timeline_pointer = (pipe_build_year - 2021) * 12 + pipe_build_month
@@ -370,8 +387,9 @@ def simulation_cars_cars(timeline, uplifts, tax_stats, cars_stats):
     # все время возим машинами
     #выбираем какие скважины мы построим после разведки и наносим их на таймлайн
     delivery_type = 'cars'
-    oper_stats = add_multi_oper_stats_update_type(pipe_stats, cars_stats, delivery_type)
     #print(oper_stats)
+
+    uplifts = choose_wells_to_build(oper_stats, oil_stats, well_stats, uplifts)
     uplifts = choose_wells_to_build(oper_stats, oil_stats, well_stats, uplifts)
     timeline = timeline_update(timeline, uplifts, 0)
 
@@ -396,14 +414,26 @@ def simulation_cars_cars(timeline, uplifts, tax_stats, cars_stats):
     return npv
 
 def simulation_cars_none(timeline, uplifts, pipe_build_year, pipe_build_month, tax_stats, cars_stats):
-    # до постройки возим машинами, потом закрываем проект
-    #выбираем какие скважины мы построим после разведки и наносим их на таймлайн
+    #до момента принятия решения разведуем только скважины, прибыльные с доставкой машиной
     delivery_type = 'cars'
-    oper_stats = add_multi_oper_stats_update_type(pipe_stats, cars_stats, delivery_type)
-    #print(oper_stats)
-    uplifts = choose_wells_to_build(oper_stats, oil_stats, well_stats, uplifts)
-    #printer(uplifts)
-    timeline = timeline_update(timeline, uplifts, 0)
+    uplifts = choose_wells_to_recon(uplifts, 'cars')
+    uplifts = recon_rating_create(uplifts, 'cars')
+
+    #наносим разведку на таймлайн, помечаем, если успели начать разведывать
+    pipe_build_timeline_pointer = (pipe_build_year - 2021) * 12 + pipe_build_month
+    start_pointer = 0
+    finish_pointer = pipe_build_timeline_pointer
+    recon_teams_free_time = [0 for i in range(recon_stats['teams'])]
+    first_free_recon_team_pointer = 0
+    uplifts, recon_teams_free_time, first_free_recon_team_pointer = recon_set(recon_stats, timeline, uplifts, start_pointer, finish_pointer, recon_teams_free_time, first_free_recon_team_pointer)
+
+    #выбираем скважины которые построим
+    uplifts = choose_wells_to_build(uplifts, delivery_type)
+
+    #наносим их на timeline
+    destroy_pipe_pointer = 0 #он не нужен, но я просто не хочу лишнюю функцию писать
+    start_time = 0
+    timeline, destroy_pipe_pointer = timeline_build_update(timeline, uplifts, destroy_pipe_pointer, start_time)
 
     npv = 0
     losses = 0
@@ -437,22 +467,33 @@ def main(uplifts_count, uplifts, pipe_build_year, pipe_build_month, tax_stats, p
     #global well_stats #справлю, как опчюну остальное, пока пусть так
     #вообще global все _stats надо сделать и сделать неизменяемыми
     timeline = timeline_creation(12 * 30)
-    uplifts = recon_rating_create(uplifts)
-    timeline, uplifts = recon_set(recon_stats, timeline, uplifts)
 
     # пусть это результаты разведки на момент принятия решения, по-идее их должен вводить человек
     # те он должен вводить только те, которые разведал
     recon_results = recon_results_create(uplifts)
-    #print('wwwwwwwwwwwwwwwwwwwwww')
-    #printer(uplifts)
-    #print('wwwwwwwwwwwwwwwwwwwwwww')
 
-    #пометим те поднятия, которые на момент принятия решения мы разведали, чтоб не минять число нефти в них при броске точек
+    #до момента принятия решения разведуем только скважины, прибыльные с доставкой машиной
+    uplifts = choose_wells_to_recon(uplifts, 'cars')
+    uplifts = recon_rating_create(uplifts, 'cars')
+
+    #наносим разведку на таймлайн, помечаем, если успели начать разведывать
+    pipe_build_timeline_pointer = (pipe_build_year - 2021) * 12 + pipe_build_month
+    start_pointer = 0
+    finish_pointer = pipe_build_timeline_pointer
+    recon_teams_free_time = [0 for i in range(recon_stats['teams'])]
+    first_free_recon_team_pointer = 0
+    uplifts, recon_teams_free_time, first_free_recon_team_pointer = recon_set(recon_stats, timeline, uplifts, start_pointer, finish_pointer, recon_teams_free_time, first_free_recon_team_pointer)
+    print(first_free_recon_team_pointer)
+    print(recon_teams_free_time)
+    print()
+
+    #пометим те поднятия, которые на момент принятия решения мы разведали, чтоб не менять число нефти в них при броске точек
+    #помечаем, если уже получили результат разведки
     uplifts = uplifts_reconed_update(timeline, uplifts, pipe_build_year, pipe_build_month)
 
-    #print('qqqqqqqqqqqqqqqqqqqq')
-    #printer(uplifts)
-    #print('qqqqqqqqqqqqqqqqqqqq')
+    print('qqqqqqqqqqqqqqqqqqqq')
+    printer(uplifts)
+    print('qqqqqqqqqqqqqqqqqqqq')
 
     #будем считать очки за каждую симуляцию
     points = dict()
@@ -471,8 +512,12 @@ def main(uplifts_count, uplifts, pipe_build_year, pipe_build_month, tax_stats, p
     for sim_number in range(sim_count):
         #генерируем число нефти в скважине учитвая, что мы знаем, сколько нефти в уже разведомых
         uplifts = uplifts_oil_update_generation_with_considering_reconed_wells(uplifts, recon_results)
-        #print(recon_results)
-        #printer(uplifts)
+
+        # обновляем число денег которое принесет каждая скважина при таком броске точек
+        uplifts = uplifts_money_update(uplifts, oil_stats, pipe_stats, cars_stats)
+        print(uplifts)
+        printer(uplifts)
+        print('mmmmmmmmmmmmmmmmmmmmmmmmmmmm')
 
         npv = dict()
         npv['cars_pipe'] = simulation_cars_pipe(copy.deepcopy(timeline), copy.deepcopy(uplifts), pipe_build_year, pipe_build_month, tax_stats, pipe_stats, cars_stats)
@@ -507,16 +552,9 @@ def main(uplifts_count, uplifts, pipe_build_year, pipe_build_month, tax_stats, p
 
 
 data_frame = pd.ExcelFile('Датасет.xlsx')
-pipe_build_year, pipe_build_month = 2035, 0
+pipe_build_year, pipe_build_month = 2022, 0
 
 uplifts_count, recon_stats, uplifts, recon_stats, well_stats, pipe_stats, cars_stats, tax_stats, oil_stats = data_input(data_frame)
-#оцениваем каждое поднятие
-uplifts = recon_rating_create(uplifts)
 
-#создаем timeline
-timeline = timeline_creation(12 * 30)
-
-#ставим на timeline моменты начала и конца разведки, основываясь на рейтинге
-timeline, uplifts = recon_set(recon_stats, timeline, uplifts)
 
 print(main(uplifts_count, uplifts, pipe_build_year, pipe_build_month, tax_stats, pipe_stats, cars_stats, well_stats))
